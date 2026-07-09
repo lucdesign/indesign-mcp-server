@@ -30,6 +30,8 @@ class InDesignMCPServer {
       }
     );
 
+    this.appName = null; // resolved lazily by resolveAppName()
+
     this.setupToolHandlers();
   }
 
@@ -612,6 +614,77 @@ class InDesignMCPServer {
   }
 
   // =================== CORE UTILITIES ===================
+  // Resolve the installed InDesign application name (e.g. "Adobe InDesign 2026")
+  // instead of hardcoding a single year. Priority:
+  //   1. INDESIGN_APP_NAME env override
+  //   2. an InDesign instance that is already running
+  //   3. the newest "Adobe InDesign <year>.app" installed on disk
+  //   4. a sensible default
+  // The result is cached for the lifetime of the process.
+  resolveAppName() {
+    if (this.appName) return this.appName;
+
+    // 1. Explicit override
+    if (process.env.INDESIGN_APP_NAME) {
+      this.appName = process.env.INDESIGN_APP_NAME;
+      return this.appName;
+    }
+
+    // 2. Prefer an already-running instance
+    try {
+      const running = execSync(
+        `osascript -e 'tell application "System Events" to get name of (processes whose name starts with "Adobe InDesign")'`,
+        { encoding: 'utf8', timeout: 10000 }
+      ).trim();
+      if (running) {
+        this.appName = running.split(',')[0].trim();
+        return this.appName;
+      }
+    } catch {
+      // System Events unavailable or nothing running — fall through
+    }
+
+    // 3. Newest installed InDesign app bundle
+    const candidates = [];
+    const bases = ['/Applications', `${process.env.HOME || ''}/Applications`];
+    for (const base of bases) {
+      let entries;
+      try {
+        entries = fs.readdirSync(base);
+      } catch {
+        continue;
+      }
+      for (const entry of entries) {
+        if (!/^Adobe InDesign/.test(entry)) continue;
+        if (/\.app$/.test(entry)) {
+          candidates.push(entry.replace(/\.app$/, ''));
+          continue;
+        }
+        // Adobe usually nests the .app inside a versioned folder
+        try {
+          for (const inner of fs.readdirSync(path.join(base, entry))) {
+            if (/^Adobe InDesign.*\.app$/.test(inner)) {
+              candidates.push(inner.replace(/\.app$/, ''));
+            }
+          }
+        } catch {
+          // not a directory / unreadable — ignore
+        }
+      }
+    }
+    if (candidates.length) {
+      // Sort by trailing version number, newest first
+      const ver = (n) => parseInt((n.match(/\d+/) || [0])[0], 10) || 0;
+      candidates.sort((a, b) => ver(b) - ver(a));
+      this.appName = candidates[0];
+      return this.appName;
+    }
+
+    // 4. Fallback
+    this.appName = 'Adobe InDesign 2025';
+    return this.appName;
+  }
+
   async executeAppleScript(script) {
     try {
       const result = execSync(`osascript -e '${script.replace(/'/g, "'\"'\"'")}'`, {
@@ -639,8 +712,9 @@ class InDesignMCPServer {
     fs.writeFileSync(tempScript, wrappedScript);
 
     try {
+      const appName = this.resolveAppName();
       const appleScript = `
-        tell application "Adobe InDesign 2025"
+        tell application "${appName}"
           activate
           do script POSIX file "${tempScript}" language javascript
         end tell
