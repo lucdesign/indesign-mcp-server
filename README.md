@@ -1,6 +1,6 @@
 # InDesign MCP Server
 
-A comprehensive **Model Context Protocol (MCP) server** for **Adobe InDesign automation** with **35+ professional tools**. This server enables AI assistants like Claude to directly control Adobe InDesign, automating complex publishing workflows, document creation, and professional layout tasks.
+A comprehensive **Model Context Protocol (MCP) server** for **Adobe InDesign automation** with **51+ professional tools**. This server enables AI assistants like Claude to directly control Adobe InDesign, automating complex publishing workflows, document creation, and professional layout tasks.
 
 ## 🚀 Features
 
