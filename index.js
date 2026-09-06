@@ -9,6 +9,20 @@ import {
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
 import { execSync } from 'child_process';
+import {
+  str,
+  num,
+  index,
+  bool,
+  measure,
+  enumOf,
+  ALLOWED,
+  json,
+  numList,
+  jsxPath,
+  validateFilePath,
+  buildAllowedDirs,
+} from './lib/jsx-safe.js';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -16,6 +30,70 @@ import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+/**
+ * Last code character of a line — strings and comments skipped.
+ * Returns '' for lines without code.
+ */
+function lastCodeChar(line) {
+  let last = '';
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '/' && line[i + 1] === '/') break;
+    if (ch === '"' || ch === "'") {
+      const quote = ch;
+      i++;
+      while (i < line.length) {
+        if (line[i] === '\\') { i += 2; continue; }
+        if (line[i] === quote) break;
+        i++;
+      }
+      last = quote;
+      continue;
+    }
+    if (!/\s/.test(ch)) last = ch;
+  }
+  return last;
+}
+
+// Statements that yield no usable value — never prefixed.
+const NON_EXPRESSION =
+  /^(var|let|const|if|for|while|do|switch|function|try|return|throw|break|continue|with)\b/;
+
+/**
+ * Assign a script's trailing expression to __result__.
+ *
+ * The assignment may legitimately land inside a block; `var` hoisting covers
+ * that. Scripts that set __result__ themselves are left alone.
+ */
+function autoCaptureResult(script) {
+  if (/\b__result__\b/.test(script)) return script;
+
+  const lines = script.split('\n');
+
+  let end = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const t = lines[i].trim();
+    if (t && !t.startsWith('//') && !t.startsWith('}')) { end = i; break; }
+  }
+  if (end < 0) return script;
+
+  let start = end;
+  for (;;) {
+    let prev = -1;
+    for (let i = start - 1; i >= 0; i--) { if (lines[i].trim()) { prev = i; break; } }
+    if (prev < 0) break;
+    const ch = lastCodeChar(lines[prev]);
+    if (ch === '' || ch === ';' || ch === '{' || ch === '}') break;
+    start = prev;
+  }
+
+  const head = lines[start].trim();
+  if (NON_EXPRESSION.test(head) || /^[)\]}]/.test(head)) return script;
+
+  lines[start] = lines[start].replace(/^(\s*)/, '$1var __result__ = ');
+  return lines.join('\n');
+}
 
 class InDesignMCPServer {
   constructor() {
@@ -31,56 +109,35 @@ class InDesignMCPServer {
       }
     );
 
-    // Security: Define allowed directories for file operations
-    this.allowedDirectories = [
-      os.homedir(), // User home directory
-      '/Users/Shared', // Shared directory
-      // Add more as needed via environment variable
-      ...(process.env.INDESIGN_ALLOWED_DIRS ? process.env.INDESIGN_ALLOWED_DIRS.split(':') : [])
-    ];
+    // Allowed directories for file operations.
+    // Split on path.delimiter rather than ':' — on Windows the latter tears a
+    // drive letter apart: 'C:\\projects' becomes ['C', '\\projects'], and the
+    // second entry resolves on every drive.
+    this.allowedDirectories = buildAllowedDirs();
 
     this.setupToolHandlers();
   }
 
-  // Security: Path validation to prevent directory traversal
+  /**
+   * Path validation. Delegates to lib/jsx-safe.js, which is platform-aware.
+   *
+   * The previous deny-list (/etc, /System, /usr/bin, /bin, /sbin) matches
+   * nothing on Windows, so C:\\Windows\\System32 was unprotected. The
+   * `.includes('..')` check was dead code: path.resolve() has already
+   * resolved '..' by then.
+   *
+   * Kept as a method so the call sites stay unchanged.
+   */
   validateFilePath(filePath) {
-    if (!filePath || typeof filePath !== 'string') {
-      throw new Error('Invalid file path provided');
-    }
-
-    // Resolve to absolute path
-    const resolvedPath = path.resolve(filePath);
-    
-    // Check if path is within allowed directories
-    const isAllowed = this.allowedDirectories.some(allowedDir => {
-      const resolvedAllowedDir = path.resolve(allowedDir);
-      return resolvedPath.startsWith(resolvedAllowedDir + path.sep) || resolvedPath === resolvedAllowedDir;
-    });
-
-    if (!isAllowed) {
-      throw new Error(`Access denied: Path '${filePath}' is outside allowed directories. Allowed: ${this.allowedDirectories.join(', ')}`);
-    }
-
-    // Additional security checks
-    if (resolvedPath.includes('..')) {
-      throw new Error('Path traversal detected: .. not allowed in resolved path');
-    }
-
-    // Prevent access to sensitive system files
-    const prohibitedPaths = ['/etc', '/System', '/usr/bin', '/bin', '/sbin'];
-    const isProhibited = prohibitedPaths.some(prohibited => 
-      resolvedPath.startsWith(prohibited + path.sep) || resolvedPath === prohibited
-    );
-
-    if (isProhibited) {
-      throw new Error(`Access denied: Cannot access system directory '${resolvedPath}'`);
-    }
-
-    return resolvedPath;
+    return validateFilePath(filePath, this.allowedDirectories);
   }
 
   // Security: User confirmation for destructive operations
-  async requireUserConfirmation(operation, target, details = '') {
+  // Not async: it only ever throws. As an async method the rejection was
+  // never awaited by validateDestructiveOperation, so it surfaced as an
+  // unhandled rejection while the caller carried on and performed the
+  // operation anyway - the confirmation gate did not actually gate.
+  requireUserConfirmation(operation, target, details = '') {
     const warningMessage = `
 ⚠️  DESTRUCTIVE OPERATION WARNING ⚠️
 
@@ -956,24 +1013,14 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
     // Wrap script to capture return value via temp file
     const resultPath = tempResult.replace(/\\/g, '/');
     
-    // Auto-capture last expression: prepend __result__ = to last non-empty line
-    const lines = script.split('\n');
-    let lastExprIdx = -1;
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const trimmed = lines[i].trim();
-      if (trimmed && !trimmed.startsWith('//') && !trimmed.startsWith('}')) {
-        lastExprIdx = i;
-        break;
-      }
-    }
-    if (lastExprIdx >= 0) {
-      const lastLine = lines[lastExprIdx].trim();
-      // Don't prepend for statements that aren't expressions
-      if (!/^(var |let |const |if |for |while |switch |function |try |\/\/)/.test(lastLine)) {
-        lines[lastExprIdx] = 'var __result__ = ' + lines[lastExprIdx];
-      }
-    }
-    const processedScript = lines.join('\n');
+    // Auto-capture the trailing expression: assign it to __result__.
+    //
+    // The trailing expression may span several lines. Prefixing the *last*
+    // line puts the assignment in the middle of the expression, which is a
+    // syntax error — create_document has such an expression. So walk back to
+    // where the statement starts: as long as the preceding line does not end
+    // in ';', '{' or '}', it belongs to the same statement.
+    const processedScript = autoCaptureResult(script);
     
     const wrappedScript = `
       try {
@@ -1100,54 +1147,54 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
       
       // Set document dimensions
       ${preset === 'Custom' && width && height ? `
-        doc.documentPreferences.pageWidth = "${width}mm";
-        doc.documentPreferences.pageHeight = "${height}mm";
+        doc.documentPreferences.pageWidth = ${measure(width, { unit: 'mm', name: 'width' })};
+        doc.documentPreferences.pageHeight = ${measure(height, { unit: 'mm', name: 'height' })};
       ` : `
         // Standard presets
-        if ("${preset}" === "A4") {
-          doc.documentPreferences.pageWidth = "${orientation === 'Landscape' ? '297mm' : '210mm'}";
-          doc.documentPreferences.pageHeight = "${orientation === 'Landscape' ? '210mm' : '297mm'}";
-        } else if ("${preset}" === "A5") {
-          doc.documentPreferences.pageWidth = "${orientation === 'Landscape' ? '210mm' : '148mm'}";
-          doc.documentPreferences.pageHeight = "${orientation === 'Landscape' ? '148mm' : '210mm'}";
-        } else if ("${preset}" === "A3") {
-          doc.documentPreferences.pageWidth = "${orientation === 'Landscape' ? '420mm' : '297mm'}";
-          doc.documentPreferences.pageHeight = "${orientation === 'Landscape' ? '297mm' : '420mm'}";
-        } else if ("${preset}" === "Letter") {
-          doc.documentPreferences.pageWidth = "${orientation === 'Landscape' ? '279.4mm' : '215.9mm'}";
-          doc.documentPreferences.pageHeight = "${orientation === 'Landscape' ? '215.9mm' : '279.4mm'}";
-        } else if ("${preset}" === "Legal") {
-          doc.documentPreferences.pageWidth = "${orientation === 'Landscape' ? '355.6mm' : '215.9mm'}";
-          doc.documentPreferences.pageHeight = "${orientation === 'Landscape' ? '215.9mm' : '355.6mm'}";
+        if (${str(preset)} === "A4") {
+          doc.documentPreferences.pageWidth = "" + ${str(orientation === 'Landscape' ? '297mm' : '210mm')} + "";
+          doc.documentPreferences.pageHeight = "" + ${str(orientation === 'Landscape' ? '210mm' : '297mm')} + "";
+        } else if (${str(preset)} === "A5") {
+          doc.documentPreferences.pageWidth = "" + ${str(orientation === 'Landscape' ? '210mm' : '148mm')} + "";
+          doc.documentPreferences.pageHeight = "" + ${str(orientation === 'Landscape' ? '148mm' : '210mm')} + "";
+        } else if (${str(preset)} === "A3") {
+          doc.documentPreferences.pageWidth = "" + ${str(orientation === 'Landscape' ? '420mm' : '297mm')} + "";
+          doc.documentPreferences.pageHeight = "" + ${str(orientation === 'Landscape' ? '297mm' : '420mm')} + "";
+        } else if (${str(preset)} === "Letter") {
+          doc.documentPreferences.pageWidth = "" + ${str(orientation === 'Landscape' ? '279.4mm' : '215.9mm')} + "";
+          doc.documentPreferences.pageHeight = "" + ${str(orientation === 'Landscape' ? '215.9mm' : '279.4mm')} + "";
+        } else if (${str(preset)} === "Legal") {
+          doc.documentPreferences.pageWidth = "" + ${str(orientation === 'Landscape' ? '355.6mm' : '215.9mm')} + "";
+          doc.documentPreferences.pageHeight = "" + ${str(orientation === 'Landscape' ? '215.9mm' : '355.6mm')} + "";
         }
       `}
       
       // Document setup
-      doc.documentPreferences.facingPages = ${facingPages};
-      doc.documentPreferences.pagesPerDocument = ${pages};
+      doc.documentPreferences.facingPages = ${bool(facingPages)};
+      doc.documentPreferences.pagesPerDocument = ${num(pages, { name: 'pages' })};
       
       // Bleed and slug
-      if (${bleed} > 0) {
-        doc.documentPreferences.documentBleedTopOffset = "${bleed}mm";
-        doc.documentPreferences.documentBleedBottomOffset = "${bleed}mm";
-        doc.documentPreferences.documentBleedInsideOrLeftOffset = "${bleed}mm";
-        doc.documentPreferences.documentBleedOutsideOrRightOffset = "${bleed}mm";
+      if (${num(bleed, { name: 'bleed' })} > 0) {
+        doc.documentPreferences.documentBleedTopOffset = ${measure(bleed, { unit: 'mm', name: 'bleed' })};
+        doc.documentPreferences.documentBleedBottomOffset = ${measure(bleed, { unit: 'mm', name: 'bleed' })};
+        doc.documentPreferences.documentBleedInsideOrLeftOffset = ${measure(bleed, { unit: 'mm', name: 'bleed' })};
+        doc.documentPreferences.documentBleedOutsideOrRightOffset = ${measure(bleed, { unit: 'mm', name: 'bleed' })};
       }
       
-      if (${slug} > 0) {
-        doc.documentPreferences.slugTopOffset = "${slug}mm";
-        doc.documentPreferences.slugBottomOffset = "${slug}mm";
-        doc.documentPreferences.slugInsideOrLeftOffset = "${slug}mm";
-        doc.documentPreferences.slugRightOrOutsideOffset = "${slug}mm";
+      if (${num(slug, { name: 'slug' })} > 0) {
+        doc.documentPreferences.slugTopOffset = ${measure(slug, { unit: 'mm', name: 'slug' })};
+        doc.documentPreferences.slugBottomOffset = ${measure(slug, { unit: 'mm', name: 'slug' })};
+        doc.documentPreferences.slugInsideOrLeftOffset = ${measure(slug, { unit: 'mm', name: 'slug' })};
+        doc.documentPreferences.slugRightOrOutsideOffset = ${measure(slug, { unit: 'mm', name: 'slug' })};
       }
       
       // Margins
-      doc.marginPreferences.top = "${marginTop}mm";
-      doc.marginPreferences.bottom = "${marginBottom}mm";
-      doc.marginPreferences.left = "${marginLeft}mm";
-      doc.marginPreferences.right = "${marginRight}mm";
+      doc.marginPreferences.top = ${measure(marginTop, { unit: 'mm', name: 'marginTop' })};
+      doc.marginPreferences.bottom = ${measure(marginBottom, { unit: 'mm', name: 'marginBottom' })};
+      doc.marginPreferences.left = ${measure(marginLeft, { unit: 'mm', name: 'marginLeft' })};
+      doc.marginPreferences.right = ${measure(marginRight, { unit: 'mm', name: 'marginRight' })};
       
-      "Document created: " + "${preset}" + " (" + doc.documentPreferences.pageWidth + " x " + doc.documentPreferences.pageHeight + "), " + 
+      "Document created: " + ${str(preset)} + " (" + doc.documentPreferences.pageWidth + " x " + doc.documentPreferences.pageHeight + "), " + 
       doc.pages.length + " pages, " + (doc.documentPreferences.facingPages ? "facing pages" : "single pages");
     `;
 
@@ -1163,9 +1210,9 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
     
     const script = `
       try {
-        var file = File("${validatedPath.replace(/\\/g, '\\\\')}");
+        var file = File(${jsxPath(validatedPath)});
         if (!file.exists) {
-          "File not found: ${validatedPath}";
+          "File not found: " + ${jsxPath(validatedPath)} + "";
         } else {
           var doc = app.open(file);
           "Document opened: " + doc.name + " (" + doc.pages.length + " pages)";
@@ -1197,7 +1244,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
         var doc = app.activeDocument;
         try {
           ${validatedPath ? `
-            var file = File("${validatedPath.replace(/\\/g, '\\\\')}");
+            var file = File(${jsxPath(validatedPath)});
             doc.save(file);
             "Document saved as: " + file.fsName;
           ` : `
@@ -1262,12 +1309,12 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           ${position === 'end' ? `
             newPage = doc.pages.add();
           ` : `
-            var refPage = doc.pages[${pageIndex || 0}];
+            var refPage = doc.pages[${index(pageIndex || 0, { name: 'pageIndex' })}];
             newPage = doc.pages.add(${position === 'before' ? 'LocationOptions.BEFORE' : 'LocationOptions.AFTER'}, refPage);
           `}
           
           ${masterPage ? `
-            var master = doc.masterSpreads.itemByName("${masterPage}");
+            var master = doc.masterSpreads.itemByName(${str(masterPage)});
             if (master.isValid) {
               newPage.appliedMaster = master;
             }
@@ -1296,14 +1343,14 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
       } else {
         var doc = app.activeDocument;
         try {
-          if (${pageIndex} >= doc.pages.length || ${pageIndex} < 0) {
-            "Invalid page index: ${pageIndex}. Document has " + doc.pages.length + " pages.";
+          if (${index(pageIndex, { name: 'pageIndex' })} >= doc.pages.length || ${index(pageIndex, { name: 'pageIndex' })} < 0) {
+            "Invalid page index: " + ${index(pageIndex, { name: 'pageIndex' })} + ". Document has " + doc.pages.length + " pages.";
           } else if (doc.pages.length === 1) {
             "Cannot delete the last page in the document.";
           } else {
-            var pageToDelete = doc.pages[${pageIndex}];
+            var pageToDelete = doc.pages[${index(pageIndex, { name: 'pageIndex' })}];
             pageToDelete.remove();
-            "Page " + (${pageIndex} + 1) + " deleted. Remaining pages: " + doc.pages.length;
+            "Page " + (${index(pageIndex, { name: 'pageIndex' })} + 1) + " deleted. Remaining pages: " + doc.pages.length;
           }
         } catch (e) {
           "Error deleting page: " + e.message;
@@ -1324,10 +1371,10 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
       } else {
         var doc = app.activeDocument;
         try {
-          if (${pageIndex} >= doc.pages.length || ${pageIndex} < 0) {
-            "Invalid page index: ${pageIndex}";
+          if (${index(pageIndex, { name: 'pageIndex' })} >= doc.pages.length || ${index(pageIndex, { name: 'pageIndex' })} < 0) {
+            "Invalid page index: " + ${index(pageIndex, { name: 'pageIndex' })} + "";
           } else {
-            var sourcePage = doc.pages[${pageIndex}];
+            var sourcePage = doc.pages[${index(pageIndex, { name: 'pageIndex' })}];
             var newPage = doc.pages.add(${position === 'before' ? 'LocationOptions.BEFORE' : 'LocationOptions.AFTER'}, sourcePage);
             
             // Copy all page items
@@ -1335,7 +1382,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
               sourcePage.allPageItems[i].duplicate(newPage);
             }
             
-            "Page " + (${pageIndex} + 1) + " duplicated. New page position: " + (newPage.documentOffset + 1);
+            "Page " + (${index(pageIndex, { name: 'pageIndex' })} + 1) + " duplicated. New page position: " + (newPage.documentOffset + 1);
           }
         } catch (e) {
           "Error duplicating page: " + e.message;
@@ -1356,11 +1403,11 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
       } else {
         var doc = app.activeDocument;
         try {
-          if (${pageIndex} >= doc.pages.length || ${pageIndex} < 0) {
-            "Invalid page index: ${pageIndex}. Document has " + doc.pages.length + " pages.";
+          if (${index(pageIndex, { name: 'pageIndex' })} >= doc.pages.length || ${index(pageIndex, { name: 'pageIndex' })} < 0) {
+            "Invalid page index: " + ${index(pageIndex, { name: 'pageIndex' })} + ". Document has " + doc.pages.length + " pages.";
           } else {
-            app.activeWindow.activePage = doc.pages[${pageIndex}];
-            "Navigated to page " + (${pageIndex} + 1);
+            app.activeWindow.activePage = doc.pages[${index(pageIndex, { name: 'pageIndex' })}];
+            "Navigated to page " + (${index(pageIndex, { name: 'pageIndex' })} + 1);
           }
         } catch (e) {
           "Error navigating to page: " + e.message;
@@ -1456,14 +1503,14 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
         }
         
         // Strategy 2: Use specific frame index if no selection or selection has no text
-        if (!textContent && typeof ${frameIndex} === "number") {
+        if (!textContent && typeof ${index(frameIndex, { name: 'frameIndex' })} === "number") {
           try {
-            var page = doc.pages[${pageIndex}];
-            if (${frameIndex} >= 0 && ${frameIndex} < page.textFrames.length) {
-              textContent = page.textFrames[${frameIndex}].contents;
-              source = "Text frame " + ${frameIndex} + " on page " + (${pageIndex} + 1);
+            var page = doc.pages[${index(pageIndex, { name: 'pageIndex' })}];
+            if (${index(frameIndex, { name: 'frameIndex' })} >= 0 && ${index(frameIndex, { name: 'frameIndex' })} < page.textFrames.length) {
+              textContent = page.textFrames[${index(frameIndex, { name: 'frameIndex' })}].contents;
+              source = "Text frame " + ${index(frameIndex, { name: 'frameIndex' })} + " on page " + (${index(pageIndex, { name: 'pageIndex' })} + 1);
             } else {
-              source = "ERROR: Frame index " + ${frameIndex} + " invalid. Page " + (${pageIndex} + 1) + " has " + page.textFrames.length + " frames.";
+              source = "ERROR: Frame index " + ${index(frameIndex, { name: 'frameIndex' })} + " invalid. Page " + (${index(pageIndex, { name: 'pageIndex' })} + 1) + " has " + page.textFrames.length + " frames.";
             }
           } catch (e) {
             source = "ERROR: " + e.message;
@@ -1501,9 +1548,9 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           
           // Apply length limit if specified
           ${maxLength > 0 ? `
-            if (processedText.length > ${maxLength}) {
-              processedText = processedText.substring(0, ${maxLength}) + "...";
-              result += "Text truncated to " + ${maxLength} + " characters\\n\\n";
+            if (processedText.length > ${num(maxLength, { name: 'maxLength' })}) {
+              processedText = processedText.substring(0, ${num(maxLength, { name: 'maxLength' })}) + "...";
+              result += "Text truncated to " + ${num(maxLength, { name: 'maxLength' })} + " characters\\n\\n";
             }
           ` : ''}
           
@@ -1528,11 +1575,11 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
       } else {
         var doc = app.activeDocument;
         try {
-          if (${pageIndex} >= doc.pages.length || ${pageIndex} < 0) {
-            "Invalid page index: ${pageIndex}. Document has " + doc.pages.length + " pages.";
+          if (${index(pageIndex, { name: 'pageIndex' })} >= doc.pages.length || ${index(pageIndex, { name: 'pageIndex' })} < 0) {
+            "Invalid page index: " + ${index(pageIndex, { name: 'pageIndex' })} + ". Document has " + doc.pages.length + " pages.";
           } else {
-            var page = doc.pages[${pageIndex}];
-            var result = "=== TEXT FRAMES ON PAGE " + (${pageIndex} + 1) + " ===\\n";
+            var page = doc.pages[${index(pageIndex, { name: 'pageIndex' })}];
+            var result = "=== TEXT FRAMES ON PAGE " + (${index(pageIndex, { name: 'pageIndex' })} + 1) + " ===\\n";
             
             if (page.textFrames.length === 0) {
               result += "No text frames found on this page.\\n";
@@ -1579,10 +1626,10 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
         // Try to get frame from selection or frameIndex
         if (app.selection.length > 0 && app.selection[0].hasOwnProperty('contents')) {
           frame = app.selection[0];
-        } else if (typeof ${frameIndex} === "number") {
-          var page = doc.pages[${pageIndex}];
-          if (${frameIndex} >= 0 && ${frameIndex} < page.textFrames.length) {
-            frame = page.textFrames[${frameIndex}];
+        } else if (typeof ${index(frameIndex, { name: 'frameIndex' })} === "number") {
+          var page = doc.pages[${index(pageIndex, { name: 'pageIndex' })}];
+          if (${index(frameIndex, { name: 'frameIndex' })} >= 0 && ${index(frameIndex, { name: 'frameIndex' })} < page.textFrames.length) {
+            frame = page.textFrames[${index(frameIndex, { name: 'frameIndex' })}];
           }
         }
         
@@ -1607,8 +1654,8 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
             result += "Table: " + table.rows.length + " rows x " + table.columns.length + " columns\\n\\n";
             
             // Analyze first few cells
-            result += "=== FIRST " + Math.min(${maxObjects}, table.cells.length) + " CELLS ===\\n";
-            for (var i = 0; i < Math.min(${maxObjects}, table.cells.length); i++) {
+            result += "=== FIRST " + Math.min(${num(maxObjects, { name: 'maxObjects' })}, table.cells.length) + " CELLS ===\\n";
+            for (var i = 0; i < Math.min(${num(maxObjects, { name: 'maxObjects' })}, table.cells.length); i++) {
               var cell = table.cells[i];
               result += "\\nCell " + i + " (Row " + cell.rowIndex + ", Col " + cell.columnIndex + "):\\n";
               result += "  Content: " + String(cell.contents).substring(0, 100) + "\\n";
@@ -1644,8 +1691,8 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           
           // Analyze EPSTexts (MathML formulas are often EPS)
           if (frame.epstexts.length > 0) {
-            result += "=== EPS TEXTS (First " + Math.min(${maxObjects}, frame.epstexts.length) + ") ===\\n";
-            for (var i = 0; i < Math.min(${maxObjects}, frame.epstexts.length); i++) {
+            result += "=== EPS TEXTS (First " + Math.min(${num(maxObjects, { name: 'maxObjects' })}, frame.epstexts.length) + ") ===\\n";
+            for (var i = 0; i < Math.min(${num(maxObjects, { name: 'maxObjects' })}, frame.epstexts.length); i++) {
               var eps = frame.epstexts[i];
               result += "\\nObject " + i + ":\\n";
               result += "  Label: " + eps.label + "\\n";
@@ -1675,8 +1722,8 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           
           // Analyze PageItems
           if (frame.pageItems.length > 0) {
-            result += "\\n=== PAGE ITEMS (First " + Math.min(${maxObjects}, frame.pageItems.length) + ") ===\\n";
-            for (var i = 0; i < Math.min(${maxObjects}, frame.pageItems.length); i++) {
+            result += "\\n=== PAGE ITEMS (First " + Math.min(${num(maxObjects, { name: 'maxObjects' })}, frame.pageItems.length) + ") ===\\n";
+            for (var i = 0; i < Math.min(${num(maxObjects, { name: 'maxObjects' })}, frame.pageItems.length); i++) {
               var item = frame.pageItems[i];
               result += "\\nItem " + i + ":\\n";
               result += "  Type: " + item.constructor.name + "\\n";
@@ -1834,17 +1881,17 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
             }
           ` : `
             // Use frameIndex
-            var page = doc.pages[${pageIndex}];
-            if (${frameIndex} >= page.textFrames.length || ${frameIndex} < 0) {
-              "Invalid text frame index: ${frameIndex}. Page ${pageIndex + 1} has " + page.textFrames.length + " text frames. Use list_text_frames() to see available frames.";
+            var page = doc.pages[${index(pageIndex, { name: 'pageIndex' })}];
+            if (${index(frameIndex, { name: 'frameIndex' })} >= page.textFrames.length || ${index(frameIndex, { name: 'frameIndex' })} < 0) {
+              "Invalid text frame index: " + ${index(frameIndex, { name: 'frameIndex' })} + ". Page " + ${str(pageIndex + 1)} + " has " + page.textFrames.length + " text frames. Use list_text_frames() to see available frames.";
             } else {
-              textFrame = page.textFrames[${frameIndex}];
+              textFrame = page.textFrames[${index(frameIndex, { name: 'frameIndex' })}];
             }
           `}
           
           if (textFrame) {
             // Convert markdown to formatted text
-            var markdownContent = \`${markdownText.replace(/`/g, '\\`').replace(/\$/g, '\\$')}\`;
+            var markdownContent = ${str(markdownText)};
             
             ${replaceContent ? 'textFrame.contents = "";' : ''}
             
@@ -2009,11 +2056,11 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
               textFrame = selection[0];
             }
           ` : `
-            var page = doc.pages[${pageIndex}];
-            if (${frameIndex} >= page.textFrames.length || ${frameIndex} < 0) {
-              "Invalid text frame index: ${frameIndex}. Use list_text_frames() to see available frames.";
+            var page = doc.pages[${index(pageIndex, { name: 'pageIndex' })}];
+            if (${index(frameIndex, { name: 'frameIndex' })} >= page.textFrames.length || ${index(frameIndex, { name: 'frameIndex' })} < 0) {
+              "Invalid text frame index: " + ${index(frameIndex, { name: 'frameIndex' })} + ". Use list_text_frames() to see available frames.";
             } else {
-              textFrame = page.textFrames[${frameIndex}];
+              textFrame = page.textFrames[${index(frameIndex, { name: 'frameIndex' })}];
             }
           `}
           
@@ -2073,7 +2120,10 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
               var beforeQuotes = (story.contents.match(/"/g) || []).length;
               if (beforeQuotes > 0) {
                 // Simple quote replacement (could be enhanced)
-                story.contents = story.contents.replace(/"/g, "„").replace(/„/g, """).replace(/"/g, "„");
+                var __q__ = 0;
+                story.contents = story.contents.replace(/"/g, function () {
+                  return (__q__++ % 2 === 0) ? "\u201E" : "\u201C";
+                });
                 changeLog += "Fixed " + Math.floor(beforeQuotes/2) + " quote pair(s)\\n";
                 changes += Math.floor(beforeQuotes/2);
               }
@@ -2159,11 +2209,11 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
               textFrame = selection[0];
             }
           ` : `
-            var page = doc.pages[${pageIndex}];
-            if (${frameIndex} >= page.textFrames.length || ${frameIndex} < 0) {
-              "Invalid text frame index: ${frameIndex}. Use list_text_frames() to see available frames.";
+            var page = doc.pages[${index(pageIndex, { name: 'pageIndex' })}];
+            if (${index(frameIndex, { name: 'frameIndex' })} >= page.textFrames.length || ${index(frameIndex, { name: 'frameIndex' })} < 0) {
+              "Invalid text frame index: " + ${index(frameIndex, { name: 'frameIndex' })} + ". Use list_text_frames() to see available frames.";
             } else {
-              textFrame = page.textFrames[${frameIndex}];
+              textFrame = page.textFrames[${index(frameIndex, { name: 'frameIndex' })}];
             }
           `}
           
@@ -2355,11 +2405,11 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
               textFrame = selection[0];
             }
           ` : `
-            var page = doc.pages[${pageIndex}];
-            if (${frameIndex} >= page.textFrames.length || ${frameIndex} < 0) {
-              "Invalid text frame index: ${frameIndex}. Use list_text_frames() to see available frames.";
+            var page = doc.pages[${index(pageIndex, { name: 'pageIndex' })}];
+            if (${index(frameIndex, { name: 'frameIndex' })} >= page.textFrames.length || ${index(frameIndex, { name: 'frameIndex' })} < 0) {
+              "Invalid text frame index: " + ${index(frameIndex, { name: 'frameIndex' })} + ". Use list_text_frames() to see available frames.";
             } else {
-              textFrame = page.textFrames[${frameIndex}];
+              textFrame = page.textFrames[${index(frameIndex, { name: 'frameIndex' })}];
             }
           `}
           
@@ -2510,11 +2560,11 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
               textFrame = selection[0];
             }
           ` : `
-            var page = doc.pages[${pageIndex}];
-            if (${frameIndex} >= page.textFrames.length || ${frameIndex} < 0) {
-              "Invalid text frame index: ${frameIndex}. Use list_text_frames() to see available frames.";
+            var page = doc.pages[${index(pageIndex, { name: 'pageIndex' })}];
+            if (${index(frameIndex, { name: 'frameIndex' })} >= page.textFrames.length || ${index(frameIndex, { name: 'frameIndex' })} < 0) {
+              "Invalid text frame index: " + ${index(frameIndex, { name: 'frameIndex' })} + ". Use list_text_frames() to see available frames.";
             } else {
-              textFrame = page.textFrames[${frameIndex}];
+              textFrame = page.textFrames[${index(frameIndex, { name: 'frameIndex' })}];
             }
           `}
           
@@ -2643,48 +2693,48 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
       } else {
         var doc = app.activeDocument;
         try {
-          if (${pageIndex} >= doc.pages.length || ${pageIndex} < 0) {
-            "Invalid page index: ${pageIndex}";
+          if (${index(pageIndex, { name: 'pageIndex' })} >= doc.pages.length || ${index(pageIndex, { name: 'pageIndex' })} < 0) {
+            "Invalid page index: " + ${index(pageIndex, { name: 'pageIndex' })} + "";
           } else {
-            var page = doc.pages[${pageIndex}];
+            var page = doc.pages[${index(pageIndex, { name: 'pageIndex' })}];
             
             // Create text frame
             var textFrame = page.textFrames.add();
-            textFrame.geometricBounds = ["${y}mm", "${x}mm", "${y + height}mm", "${x + width}mm"];
+            textFrame.geometricBounds = [${measure(y, { unit: 'mm', name: 'y' })}, ${measure(x, { unit: 'mm', name: 'x' })}, ${measure(y + height, { unit: 'mm', name: 'y' })}, ${measure(x + width, { unit: 'mm', name: 'x' })}];
             
             // Add content
-            textFrame.contents = "${content.replace(/"/g, '\\"').replace(/\n/g, '\\n')}";
+            textFrame.contents = ${str(content)};
             
             // Apply formatting
             var story = textFrame.parentStory;
             
             // Font and size
             try {
-              story.characters.everyItem().appliedFont = app.fonts.itemByName("${fontFamily}\\t${fontStyle}");
+              story.characters.everyItem().appliedFont = app.fonts.itemByName("" + ${str(fontFamily)} + "\\t" + ${str(fontStyle)} + "");
             } catch (e) {
               try {
-                story.characters.everyItem().appliedFont = app.fonts.itemByName("${fontFamily}");
+                story.characters.everyItem().appliedFont = app.fonts.itemByName(${str(fontFamily)});
               } catch (e2) {
                 // Use default font
               }
             }
             
-            story.characters.everyItem().pointSize = ${fontSize};
+            story.characters.everyItem().pointSize = ${num(fontSize, { name: 'fontSize' })};
             
             // Color
             try {
-              story.characters.everyItem().fillColor = doc.swatches.itemByName("${textColor}");
+              story.characters.everyItem().fillColor = doc.swatches.itemByName(${str(textColor)});
             } catch (e) {
               // Use default color
             }
             
             // Alignment
-            story.paragraphs.everyItem().justification = Justification.${alignment};
+            story.paragraphs.everyItem().justification = Justification.${enumOf(alignment, ALLOWED.alignment, { name: 'alignment' })};
             
             // Apply styles if specified
             ${paragraphStyle ? `
               try {
-                var pStyle = doc.paragraphStyles.itemByName("${paragraphStyle}");
+                var pStyle = doc.paragraphStyles.itemByName(${str(paragraphStyle)});
                 if (pStyle.isValid) {
                   story.paragraphs.everyItem().appliedParagraphStyle = pStyle;
                 }
@@ -2693,14 +2743,14 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
             
             ${characterStyle ? `
               try {
-                var cStyle = doc.characterStyles.itemByName("${characterStyle}");
+                var cStyle = doc.characterStyles.itemByName(${str(characterStyle)});
                 if (cStyle.isValid) {
                   story.characters.everyItem().appliedCharacterStyle = cStyle;
                 }
               } catch (e) {}
             ` : ''}
             
-            "Text frame created on page " + (${pageIndex} + 1) + " with content: " + "${content.substring(0, 50)}${content.length > 50 ? '...' : ''}";
+            "Text frame created on page " + (${index(pageIndex, { name: 'pageIndex' })} + 1) + " with content: " + "" + ${str(content.substring(0, 50))} + "" + ${str(content.length > 50 ? '...' : '')} + "";
           }
         } catch (e) {
           "Error creating text frame: " + e.message;
@@ -2721,28 +2771,28 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
       } else {
         var doc = app.activeDocument;
         try {
-          var page = doc.pages[${pageIndex}];
-          if (${frameIndex} >= page.textFrames.length || ${frameIndex} < 0) {
-            "Invalid text frame index: ${frameIndex}. Page ${pageIndex + 1} has " + page.textFrames.length + " text frames (valid indices: 0-" + (page.textFrames.length - 1) + "). Use list_text_frames() to see available frames.";
+          var page = doc.pages[${index(pageIndex, { name: 'pageIndex' })}];
+          if (${index(frameIndex, { name: 'frameIndex' })} >= page.textFrames.length || ${index(frameIndex, { name: 'frameIndex' })} < 0) {
+            "Invalid text frame index: " + ${index(frameIndex, { name: 'frameIndex' })} + ". Page " + ${str(pageIndex + 1)} + " has " + page.textFrames.length + " text frames (valid indices: 0-" + (page.textFrames.length - 1) + "). Use list_text_frames() to see available frames.";
           } else {
-            var textFrame = page.textFrames[${frameIndex}];
+            var textFrame = page.textFrames[${index(frameIndex, { name: 'frameIndex' })}];
             var story = textFrame.parentStory;
             
-            ${content !== undefined ? `textFrame.contents = "${content.replace(/"/g, '\\"').replace(/\n/g, '\\n')}";` : ''}
-            ${fontSize !== undefined ? `story.characters.everyItem().pointSize = ${fontSize};` : ''}
+            ${content !== undefined ? `textFrame.contents = ${str(content)};` : ''}
+            ${fontSize !== undefined ? `story.characters.everyItem().pointSize = ${num(fontSize, { name: 'fontSize' })};` : ''}
             ${fontFamily !== undefined ? `
               try {
-                story.characters.everyItem().appliedFont = app.fonts.itemByName("${fontFamily}");
+                story.characters.everyItem().appliedFont = app.fonts.itemByName(${str(fontFamily)});
               } catch (e) {}
             ` : ''}
             ${textColor !== undefined ? `
               try {
-                story.characters.everyItem().fillColor = doc.swatches.itemByName("${textColor}");
+                story.characters.everyItem().fillColor = doc.swatches.itemByName(${str(textColor)});
               } catch (e) {}
             ` : ''}
-            ${alignment !== undefined ? `story.paragraphs.everyItem().justification = Justification.${alignment};` : ''}
+            ${alignment !== undefined ? `story.paragraphs.everyItem().justification = Justification.${enumOf(alignment, ALLOWED.alignment, { name: 'alignment' })};` : ''}
             
-            "Text frame " + ${frameIndex} + " on page " + (${pageIndex} + 1) + " updated successfully";
+            "Text frame " + ${index(frameIndex, { name: 'frameIndex' })} + " on page " + (${index(pageIndex, { name: 'pageIndex' })} + 1) + " updated successfully";
           }
         } catch (e) {
           "Error editing text frame: " + e.message;
@@ -2769,13 +2819,13 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           
           // Set find preferences
           ${useGrep ? `
-            app.findGrepPreferences.findWhat = "${findText.replace(/"/g, '\\"')}";
-            app.changeGrepPreferences.changeTo = "${replaceText.replace(/"/g, '\\"')}";
+            app.findGrepPreferences.findWhat = ${str(findText)};
+            app.changeGrepPreferences.changeTo = ${str(replaceText)};
           ` : `
-            app.findTextPreferences.findWhat = "${findText.replace(/"/g, '\\"')}";
-            app.changeTextPreferences.changeTo = "${replaceText.replace(/"/g, '\\"')}";
-            app.findTextPreferences.caseSensitive = ${caseSensitive};
-            app.findTextPreferences.wholeWord = ${wholeWord};
+            app.findTextPreferences.findWhat = ${str(findText)};
+            app.changeTextPreferences.changeTo = ${str(replaceText)};
+            app.findTextPreferences.caseSensitive = ${bool(caseSensitive)};
+            app.findTextPreferences.wholeWord = ${bool(wholeWord)};
           `}
           
           var foundItems;
@@ -2796,7 +2846,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           app.findGrepPreferences = NothingEnum.nothing;
           app.changeGrepPreferences = NothingEnum.nothing;
           
-          "Found and replaced " + changeCount + " instances of '" + "${findText}" + "' with '" + "${replaceText}" + "'";
+          "Found and replaced " + changeCount + " instances of '" + ${str(findText)} + "' with '" + ${str(replaceText)} + "'";
         } catch (e) {
           "Error in find/replace: " + e.message;
         }
@@ -2820,27 +2870,27 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
       } else {
         var doc = app.activeDocument;
         try {
-          var page = doc.pages[${pageIndex}];
-          var imageFile = File("${validatedPath.replace(/\\/g, '\\\\')}");
+          var page = doc.pages[${index(pageIndex, { name: 'pageIndex' })}];
+          var imageFile = File(${jsxPath(validatedPath)});
           
           if (!imageFile.exists) {
-            "Image file not found: ${validatedPath}";
+            "Image file not found: " + ${jsxPath(validatedPath)} + "";
           } else {
             ${createFrame ? `
               var rect = page.rectangles.add();
               ${width && height ? `
-                rect.geometricBounds = ["${y}mm", "${x}mm", "${y + height}mm", "${x + width}mm"];
+                rect.geometricBounds = [${measure(y, { unit: 'mm', name: 'y' })}, ${measure(x, { unit: 'mm', name: 'x' })}, ${measure(y + height, { unit: 'mm', name: 'y' })}, ${measure(x + width, { unit: 'mm', name: 'x' })}];
               ` : `
-                rect.geometricBounds = ["${y}mm", "${x}mm", "${y + 50}mm", "${x + 50}mm"];
+                rect.geometricBounds = [${measure(y, { unit: 'mm', name: 'y' })}, ${measure(x, { unit: 'mm', name: 'x' })}, ${measure(y + 50, { unit: 'mm', name: 'y' })}, ${measure(x + 50, { unit: 'mm', name: 'x' })}];
               `}
               rect.place(imageFile);
             ` : `
-              page.place(imageFile, ["${x}mm", "${y}mm"]);
+              page.place(imageFile, [${measure(x, { unit: 'mm', name: 'x' })}, ${measure(y, { unit: 'mm', name: 'y' })}]);
               var rect = page.rectangles[page.rectangles.length - 1];
             `}
             
             // Apply fit option
-            switch ("${fitOption}") {
+            switch (${str(fitOption)}) {
               case "PROPORTIONALLY":
                 rect.fit(FitOptions.PROPORTIONALLY);
                 break;
@@ -2855,7 +2905,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
                 break;
             }
             
-            "Image placed: " + imageFile.name + " on page " + (${pageIndex} + 1);
+            "Image placed: " + imageFile.name + " on page " + (${index(pageIndex, { name: 'pageIndex' })} + 1);
           }
         } catch (e) {
           "Error placing image: " + e.message;
@@ -2876,23 +2926,23 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
       } else {
         var doc = app.activeDocument;
         try {
-          var page = doc.pages[${pageIndex}];
+          var page = doc.pages[${index(pageIndex, { name: 'pageIndex' })}];
           var rect = page.rectangles.add();
           
-          rect.geometricBounds = ["${y}mm", "${x}mm", "${y + height}mm", "${x + width}mm"];
+          rect.geometricBounds = [${measure(y, { unit: 'mm', name: 'y' })}, ${measure(x, { unit: 'mm', name: 'x' })}, ${measure(y + height, { unit: 'mm', name: 'y' })}, ${measure(x + width, { unit: 'mm', name: 'x' })}];
           
           ${cornerRadius > 0 ? `
-            rect.cornerRadius = "${cornerRadius}mm";
+            rect.cornerRadius = ${measure(cornerRadius, { unit: 'mm', name: 'cornerRadius' })};
           ` : ''}
           
           ${fillColor ? `
             try {
-              rect.fillColor = doc.swatches.itemByName("${fillColor}");
+              rect.fillColor = doc.swatches.itemByName(${str(fillColor)});
             } catch (e) {
               // Try to create color if it doesn't exist
               try {
                 var newSwatch = doc.colors.add();
-                newSwatch.name = "${fillColor}";
+                newSwatch.name = ${str(fillColor)};
                 rect.fillColor = newSwatch;
               } catch (e2) {}
             }
@@ -2900,12 +2950,12 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           
           ${strokeColor ? `
             try {
-              rect.strokeColor = doc.swatches.itemByName("${strokeColor}");
-              rect.strokeWeight = "${strokeWidth}pt";
+              rect.strokeColor = doc.swatches.itemByName(${str(strokeColor)});
+              rect.strokeWeight = ${measure(strokeWidth, { unit: 'pt', name: 'strokeWidth' })};
             } catch (e) {}
           ` : ''}
           
-          "Rectangle created on page " + (${pageIndex} + 1) + " (${width}mm x ${height}mm)";
+          "Rectangle created on page " + (${index(pageIndex, { name: 'pageIndex' })} + 1) + " (" + ${num(width, { name: 'width' })} + "mm x " + ${num(height, { name: 'height' })} + "mm)";
         } catch (e) {
           "Error creating rectangle: " + e.message;
         }
@@ -2925,25 +2975,25 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
       } else {
         var doc = app.activeDocument;
         try {
-          var page = doc.pages[${pageIndex}];
+          var page = doc.pages[${index(pageIndex, { name: 'pageIndex' })}];
           var ellipse = page.ovals.add();
           
-          ellipse.geometricBounds = ["${y}mm", "${x}mm", "${y + height}mm", "${x + width}mm"];
+          ellipse.geometricBounds = [${measure(y, { unit: 'mm', name: 'y' })}, ${measure(x, { unit: 'mm', name: 'x' })}, ${measure(y + height, { unit: 'mm', name: 'y' })}, ${measure(x + width, { unit: 'mm', name: 'x' })}];
           
           ${fillColor ? `
             try {
-              ellipse.fillColor = doc.swatches.itemByName("${fillColor}");
+              ellipse.fillColor = doc.swatches.itemByName(${str(fillColor)});
             } catch (e) {}
           ` : ''}
           
           ${strokeColor ? `
             try {
-              ellipse.strokeColor = doc.swatches.itemByName("${strokeColor}");
-              ellipse.strokeWeight = "${strokeWidth}pt";
+              ellipse.strokeColor = doc.swatches.itemByName(${str(strokeColor)});
+              ellipse.strokeWeight = ${measure(strokeWidth, { unit: 'pt', name: 'strokeWidth' })};
             } catch (e) {}
           ` : ''}
           
-          "Ellipse created on page " + (${pageIndex} + 1) + " (${width}mm x ${height}mm)";
+          "Ellipse created on page " + (${index(pageIndex, { name: 'pageIndex' })} + 1) + " (" + ${num(width, { name: 'width' })} + "mm x " + ${num(height, { name: 'height' })} + "mm)";
         } catch (e) {
           "Error creating ellipse: " + e.message;
         }
@@ -2965,11 +3015,11 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
         var doc = app.activeDocument;
         try {
           var pStyle = doc.paragraphStyles.add();
-          pStyle.name = "${name}";
+          pStyle.name = ${str(name)};
           
           ${baseStyle ? `
             try {
-              var base = doc.paragraphStyles.itemByName("${baseStyle}");
+              var base = doc.paragraphStyles.itemByName(${str(baseStyle)});
               if (base.isValid) {
                 pStyle.basedOn = base;
               }
@@ -2978,23 +3028,23 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           
           ${fontFamily ? `
             try {
-              pStyle.appliedFont = app.fonts.itemByName("${fontFamily}");
+              pStyle.appliedFont = app.fonts.itemByName(${str(fontFamily)});
             } catch (e) {}
           ` : ''}
           
-          ${fontSize ? `pStyle.pointSize = ${fontSize};` : ''}
-          ${leading ? `pStyle.leading = ${leading};` : ''}
-          ${spaceBefore ? `pStyle.spaceBefore = "${spaceBefore}mm";` : ''}
-          ${spaceAfter ? `pStyle.spaceAfter = "${spaceAfter}mm";` : ''}
-          ${alignment ? `pStyle.justification = Justification.${alignment};` : ''}
+          ${fontSize ? `pStyle.pointSize = ${num(fontSize, { name: 'fontSize' })};` : ''}
+          ${leading ? `pStyle.leading = ${num(leading, { name: 'leading' })};` : ''}
+          ${spaceBefore ? `pStyle.spaceBefore = ${measure(spaceBefore, { unit: 'mm', name: 'spaceBefore' })};` : ''}
+          ${spaceAfter ? `pStyle.spaceAfter = ${measure(spaceAfter, { unit: 'mm', name: 'spaceAfter' })};` : ''}
+          ${alignment ? `pStyle.justification = Justification.${enumOf(alignment, ALLOWED.alignment, { name: 'alignment' })};` : ''}
           
           ${textColor ? `
             try {
-              pStyle.fillColor = doc.swatches.itemByName("${textColor}");
+              pStyle.fillColor = doc.swatches.itemByName(${str(textColor)});
             } catch (e) {}
           ` : ''}
           
-          "Paragraph style '${name}' created successfully";
+          "Paragraph style '" + ${str(name)} + "' created successfully";
         } catch (e) {
           "Error creating paragraph style: " + e.message;
         }
@@ -3015,11 +3065,11 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
         var doc = app.activeDocument;
         try {
           var cStyle = doc.characterStyles.add();
-          cStyle.name = "${name}";
+          cStyle.name = ${str(name)};
           
           ${baseStyle ? `
             try {
-              var base = doc.characterStyles.itemByName("${baseStyle}");
+              var base = doc.characterStyles.itemByName(${str(baseStyle)});
               if (base.isValid) {
                 cStyle.basedOn = base;
               }
@@ -3029,23 +3079,23 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           ${fontFamily ? `
             try {
               ${fontStyle ? `
-                cStyle.appliedFont = app.fonts.itemByName("${fontFamily}\\t${fontStyle}");
+                cStyle.appliedFont = app.fonts.itemByName("" + ${str(fontFamily)} + "\\t" + ${str(fontStyle)} + "");
               ` : `
-                cStyle.appliedFont = app.fonts.itemByName("${fontFamily}");
+                cStyle.appliedFont = app.fonts.itemByName(${str(fontFamily)});
               `}
             } catch (e) {}
           ` : ''}
           
-          ${fontSize ? `cStyle.pointSize = ${fontSize};` : ''}
-          ${tracking ? `cStyle.tracking = ${tracking};` : ''}
+          ${fontSize ? `cStyle.pointSize = ${num(fontSize, { name: 'fontSize' })};` : ''}
+          ${tracking ? `cStyle.tracking = ${num(tracking, { name: 'tracking' })};` : ''}
           
           ${textColor ? `
             try {
-              cStyle.fillColor = doc.swatches.itemByName("${textColor}");
+              cStyle.fillColor = doc.swatches.itemByName(${str(textColor)});
             } catch (e) {}
           ` : ''}
           
-          "Character style '${name}' created successfully";
+          "Character style '" + ${str(name)} + "' created successfully";
         } catch (e) {
           "Error creating character style: " + e.message;
         }
@@ -3066,50 +3116,50 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
         var doc = app.activeDocument;
         try {
           // Find the character style
-          var cStyle = doc.characterStyles.itemByName("${styleName}");
+          var cStyle = doc.characterStyles.itemByName(${str(styleName)});
           if (!cStyle.isValid) {
-            "Character style '${styleName}' not found";
+            "Character style '" + ${str(styleName)} + "' not found";
           } else {
             var changes = [];
             
             ${fontFamily ? `
-              cStyle.appliedFont = "${fontFamily}";
-              changes.push("Font Family: ${fontFamily}");
+              cStyle.appliedFont = ${str(fontFamily)};
+              changes.push("Font Family: " + ${str(fontFamily)} + "");
             ` : ''}
             
             ${fontStyle ? `
-              cStyle.fontStyle = "${fontStyle}";
-              changes.push("Font Style: ${fontStyle}");
+              cStyle.fontStyle = ${str(fontStyle)};
+              changes.push("Font Style: " + ${str(fontStyle)} + "");
             ` : ''}
             
             ${fontSize ? `
-              cStyle.pointSize = ${fontSize};
-              changes.push("Font Size: ${fontSize}pt");
+              cStyle.pointSize = ${num(fontSize, { name: 'fontSize' })};
+              changes.push("Font Size: " + ${num(fontSize, { name: 'fontSize' })} + "pt");
             ` : ''}
             
             ${textColor ? `
               try {
-                var colorSwatch = doc.colors.itemByName("${textColor}");
+                var colorSwatch = doc.colors.itemByName(${str(textColor)});
                 if (colorSwatch.isValid) {
                   cStyle.fillColor = colorSwatch;
-                  changes.push("Text Color: ${textColor}");
+                  changes.push("Text Color: " + ${str(textColor)} + "");
                 } else {
-                  changes.push("Warning: Color '${textColor}' not found");
+                  changes.push("Warning: Color '" + ${str(textColor)} + "' not found");
                 }
               } catch (e) {
-                changes.push("Warning: Could not apply color '${textColor}': " + e.message);
+                changes.push("Warning: Could not apply color '" + ${str(textColor)} + "': " + e.message);
               }
             ` : ''}
             
             ${tracking ? `
-              cStyle.tracking = ${tracking};
-              changes.push("Tracking: ${tracking}");
+              cStyle.tracking = ${num(tracking, { name: 'tracking' })};
+              changes.push("Tracking: " + ${num(tracking, { name: 'tracking' })} + "");
             ` : ''}
             
             if (changes.length > 0) {
-              "Character style '${styleName}' modified:\\n" + changes.join("\\n");
+              "Character style '" + ${str(styleName)} + "' modified:\\n" + changes.join("\\n");
             } else {
-              "No properties specified to modify for character style '${styleName}'";
+              "No properties specified to modify for character style '" + ${str(styleName)} + "'";
             }
           }
         } catch (e) {
@@ -3132,60 +3182,60 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
         var doc = app.activeDocument;
         try {
           // Find the paragraph style
-          var pStyle = doc.paragraphStyles.itemByName("${styleName}");
+          var pStyle = doc.paragraphStyles.itemByName(${str(styleName)});
           if (!pStyle.isValid) {
-            "Paragraph style '${styleName}' not found";
+            "Paragraph style '" + ${str(styleName)} + "' not found";
           } else {
             var changes = [];
             
             ${fontFamily ? `
-              pStyle.appliedFont = "${fontFamily}";
-              changes.push("Font Family: ${fontFamily}");
+              pStyle.appliedFont = ${str(fontFamily)};
+              changes.push("Font Family: " + ${str(fontFamily)} + "");
             ` : ''}
             
             ${fontSize ? `
-              pStyle.pointSize = ${fontSize};
-              changes.push("Font Size: ${fontSize}pt");
+              pStyle.pointSize = ${num(fontSize, { name: 'fontSize' })};
+              changes.push("Font Size: " + ${num(fontSize, { name: 'fontSize' })} + "pt");
             ` : ''}
             
             ${leading ? `
-              pStyle.leading = ${leading};
-              changes.push("Leading: ${leading}pt");
+              pStyle.leading = ${num(leading, { name: 'leading' })};
+              changes.push("Leading: " + ${num(leading, { name: 'leading' })} + "pt");
             ` : ''}
             
             ${spaceBefore ? `
-              pStyle.spaceBefore = "${spaceBefore}mm";
-              changes.push("Space Before: ${spaceBefore}mm");
+              pStyle.spaceBefore = ${measure(spaceBefore, { unit: 'mm', name: 'spaceBefore' })};
+              changes.push("Space Before: " + ${num(spaceBefore, { name: 'spaceBefore' })} + "mm");
             ` : ''}
             
             ${spaceAfter ? `
-              pStyle.spaceAfter = "${spaceAfter}mm";
-              changes.push("Space After: ${spaceAfter}mm");
+              pStyle.spaceAfter = ${measure(spaceAfter, { unit: 'mm', name: 'spaceAfter' })};
+              changes.push("Space After: " + ${num(spaceAfter, { name: 'spaceAfter' })} + "mm");
             ` : ''}
             
             ${alignment ? `
-              pStyle.justification = Justification.${alignment};
-              changes.push("Alignment: ${alignment}");
+              pStyle.justification = Justification.${enumOf(alignment, ALLOWED.alignment, { name: 'alignment' })};
+              changes.push("Alignment: " + ${str(alignment)} + "");
             ` : ''}
             
             ${textColor ? `
               try {
-                var colorSwatch = doc.colors.itemByName("${textColor}");
+                var colorSwatch = doc.colors.itemByName(${str(textColor)});
                 if (colorSwatch.isValid) {
                   pStyle.fillColor = colorSwatch;
-                  changes.push("Text Color: ${textColor}");
+                  changes.push("Text Color: " + ${str(textColor)} + "");
                 } else {
-                  changes.push("Warning: Color '${textColor}' not found");
+                  changes.push("Warning: Color '" + ${str(textColor)} + "' not found");
                 }
               } catch (e) {
-                changes.push("Warning: Could not apply color '${textColor}': " + e.message);
+                changes.push("Warning: Could not apply color '" + ${str(textColor)} + "': " + e.message);
               }
             ` : ''}
             
             if (changes.length > 0) {
-              "Paragraph style '${styleName}' modified:\\n" + changes.join("\\n");
+              "Paragraph style '" + ${str(styleName)} + "' modified:\\n" + changes.join("\\n");
             } else {
-              "No properties specified to modify for paragraph style '${styleName}'";
+              "No properties specified to modify for paragraph style '" + ${str(styleName)} + "'";
             }
           }
         } catch (e) {
@@ -3208,54 +3258,54 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
         var doc = app.activeDocument;
         try {
           // Find the object style
-          var oStyle = doc.objectStyles.itemByName("${styleName}");
+          var oStyle = doc.objectStyles.itemByName(${str(styleName)});
           if (!oStyle.isValid) {
-            "Object style '${styleName}' not found";
+            "Object style '" + ${str(styleName)} + "' not found";
           } else {
             var changes = [];
             
             ${fillColor ? `
               try {
-                var fillSwatch = doc.colors.itemByName("${fillColor}");
+                var fillSwatch = doc.colors.itemByName(${str(fillColor)});
                 if (fillSwatch.isValid) {
                   oStyle.fillColor = fillSwatch;
-                  changes.push("Fill Color: ${fillColor}");
+                  changes.push("Fill Color: " + ${str(fillColor)} + "");
                 } else {
-                  changes.push("Warning: Fill color '${fillColor}' not found");
+                  changes.push("Warning: Fill color '" + ${str(fillColor)} + "' not found");
                 }
               } catch (e) {
-                changes.push("Warning: Could not apply fill color '${fillColor}': " + e.message);
+                changes.push("Warning: Could not apply fill color '" + ${str(fillColor)} + "': " + e.message);
               }
             ` : ''}
             
             ${strokeColor ? `
               try {
-                var strokeSwatch = doc.colors.itemByName("${strokeColor}");
+                var strokeSwatch = doc.colors.itemByName(${str(strokeColor)});
                 if (strokeSwatch.isValid) {
                   oStyle.strokeColor = strokeSwatch;
-                  changes.push("Stroke Color: ${strokeColor}");
+                  changes.push("Stroke Color: " + ${str(strokeColor)} + "");
                 } else {
-                  changes.push("Warning: Stroke color '${strokeColor}' not found");
+                  changes.push("Warning: Stroke color '" + ${str(strokeColor)} + "' not found");
                 }
               } catch (e) {
-                changes.push("Warning: Could not apply stroke color '${strokeColor}': " + e.message);
+                changes.push("Warning: Could not apply stroke color '" + ${str(strokeColor)} + "': " + e.message);
               }
             ` : ''}
             
             ${strokeWidth ? `
-              oStyle.strokeWeight = ${strokeWidth};
-              changes.push("Stroke Width: ${strokeWidth}pt");
+              oStyle.strokeWeight = ${num(strokeWidth, { name: 'strokeWidth' })};
+              changes.push("Stroke Width: " + ${num(strokeWidth, { name: 'strokeWidth' })} + "pt");
             ` : ''}
             
             ${transparency ? `
-              oStyle.transparencySettings.blendingSettings.opacity = ${100 - transparency};
-              changes.push("Transparency: ${transparency}%");
+              oStyle.transparencySettings.blendingSettings.opacity = ${num(100 - transparency, { name: 'transparency' })};
+              changes.push("Transparency: " + ${num(transparency, { name: 'transparency' })} + "%");
             ` : ''}
             
             if (changes.length > 0) {
-              "Object style '${styleName}' modified:\\n" + changes.join("\\n");
+              "Object style '" + ${str(styleName)} + "' modified:\\n" + changes.join("\\n");
             } else {
-              "No properties specified to modify for object style '${styleName}'";
+              "No properties specified to modify for object style '" + ${str(styleName)} + "'";
             }
           }
         } catch (e) {
@@ -3278,11 +3328,11 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
         var doc = app.activeDocument;
         try {
           var oStyle = doc.objectStyles.add();
-          oStyle.name = "${name}";
+          oStyle.name = ${str(name)};
           
           ${baseStyle ? `
             try {
-              var base = doc.objectStyles.itemByName("${baseStyle}");
+              var base = doc.objectStyles.itemByName(${str(baseStyle)});
               if (base.isValid) {
                 oStyle.basedOn = base;
               }
@@ -3291,7 +3341,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           
           ${fillColor ? `
             try {
-              var fillSwatch = doc.colors.itemByName("${fillColor}");
+              var fillSwatch = doc.colors.itemByName(${str(fillColor)});
               if (fillSwatch.isValid) {
                 oStyle.fillColor = fillSwatch;
               }
@@ -3300,7 +3350,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           
           ${strokeColor ? `
             try {
-              var strokeSwatch = doc.colors.itemByName("${strokeColor}");
+              var strokeSwatch = doc.colors.itemByName(${str(strokeColor)});
               if (strokeSwatch.isValid) {
                 oStyle.strokeColor = strokeSwatch;
               }
@@ -3308,11 +3358,11 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           ` : ''}
           
           ${strokeWidth ? `
-            oStyle.strokeWeight = ${strokeWidth};
+            oStyle.strokeWeight = ${num(strokeWidth, { name: 'strokeWidth' })};
           ` : ''}
           
           ${transparency ? `
-            oStyle.transparencySettings.blendingSettings.opacity = ${100 - transparency};
+            oStyle.transparencySettings.blendingSettings.opacity = ${num(100 - transparency, { name: 'transparency' })};
           ` : ''}
           
           "Object style '" + oStyle.name + "' created successfully";
@@ -3335,9 +3385,9 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
       } else {
         var doc = app.activeDocument;
         try {
-          var oStyle = doc.objectStyles.itemByName("${styleName}");
+          var oStyle = doc.objectStyles.itemByName(${str(styleName)});
           if (!oStyle.isValid) {
-            "Object style '${styleName}' not found";
+            "Object style '" + ${str(styleName)} + "' not found";
           } else {
             var objectsToStyle = [];
             
@@ -3348,12 +3398,12 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
               }
             }
             // Strategy 2: Use specific object index
-            else if (typeof ${objectIndex} === "number") {
-              var page = doc.pages[${pageIndex}];
-              if (${objectIndex} >= 0 && ${objectIndex} < page.allPageItems.length) {
-                objectsToStyle.push(page.allPageItems[${objectIndex}]);
+            else if (typeof ${index(objectIndex, { name: 'objectIndex' })} === "number") {
+              var page = doc.pages[${index(pageIndex, { name: 'pageIndex' })}];
+              if (${index(objectIndex, { name: 'objectIndex' })} >= 0 && ${index(objectIndex, { name: 'objectIndex' })} < page.allPageItems.length) {
+                objectsToStyle.push(page.allPageItems[${index(objectIndex, { name: 'objectIndex' })}]);
               } else {
-                "Invalid object index: ${objectIndex}. Page ${pageIndex + 1} has " + page.allPageItems.length + " objects.";
+                "Invalid object index: " + ${index(objectIndex, { name: 'objectIndex' })} + ". Page " + ${str(pageIndex + 1)} + " has " + page.allPageItems.length + " objects.";
               }
             } else {
               "No objects selected and no objectIndex specified. Please select objects or provide objectIndex.";
@@ -3369,7 +3419,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
                   }
                 } catch (e) {}
               }
-              "Object style '${styleName}' applied to " + appliedCount + " object(s)";
+              "Object style '" + ${str(styleName)} + "' applied to " + appliedCount + " object(s)";
             }
           }
         } catch (e) {
@@ -3391,21 +3441,21 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
       } else {
         var doc = app.activeDocument;
         try {
-          var page = doc.pages[${pageIndex}];
-          var textFrame = page.textFrames[${frameIndex}];
-          var style = doc.paragraphStyles.itemByName("${styleName}");
+          var page = doc.pages[${index(pageIndex, { name: 'pageIndex' })}];
+          var textFrame = page.textFrames[${index(frameIndex, { name: 'frameIndex' })}];
+          var style = doc.paragraphStyles.itemByName(${str(styleName)});
           
           if (!style.isValid) {
-            "Paragraph style '${styleName}' not found";
+            "Paragraph style '" + ${str(styleName)} + "' not found";
           } else {
             ${startIndex !== undefined && endIndex !== undefined ? `
-              var textRange = textFrame.parentStory.characters.itemByRange(${startIndex}, ${endIndex});
+              var textRange = textFrame.parentStory.characters.itemByRange(${index(startIndex, { name: 'startIndex' })}, ${index(endIndex, { name: 'endIndex' })});
               textRange.paragraphs.everyItem().appliedParagraphStyle = style;
             ` : `
               textFrame.parentStory.paragraphs.everyItem().appliedParagraphStyle = style;
             `}
             
-            "Paragraph style '${styleName}' applied to text frame ${frameIndex}";
+            "Paragraph style '" + ${str(styleName)} + "' applied to text frame " + ${index(frameIndex, { name: 'frameIndex' })} + "";
           }
         } catch (e) {
           "Error applying paragraph style: " + e.message;
@@ -3470,21 +3520,21 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
         try {
           var newColor;
           
-          if ("${colorModel}" === "CMYK") {
+          if (${str(colorModel)} === "CMYK") {
             newColor = doc.colors.add();
-            newColor.name = "${name}";
+            newColor.name = ${str(name)};
             newColor.model = ColorModel.SPOT;
-            newColor.colorValue = [${colorValues.join(', ')}];
+            newColor.colorValue = [${numList(colorValues, { name: 'colorValues' })}];
             ${spotColor ? `newColor.model = ColorModel.SPOT;` : `newColor.model = ColorModel.PROCESS;`}
-          } else if ("${colorModel}" === "RGB") {
+          } else if (${str(colorModel)} === "RGB") {
             newColor = doc.colors.add();
-            newColor.name = "${name}";
+            newColor.name = ${str(name)};
             newColor.model = ColorModel.PROCESS;
             newColor.space = ColorSpace.RGB;
-            newColor.colorValue = [${colorValues.join(', ')}];
+            newColor.colorValue = [${numList(colorValues, { name: 'colorValues' })}];
           }
           
-          "Color swatch '${name}' created (${colorModel}: ${colorValues.join(', ')})";
+          "Color swatch '" + ${str(name)} + "' created (" + ${str(colorModel)} + ": ${numList(colorValues, { name: 'colorValues' })})";
         } catch (e) {
           "Error creating color swatch: " + e.message;
         }
@@ -3535,20 +3585,20 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
       } else {
         var doc = app.activeDocument;
         try {
-          var page = doc.pages[${pageIndex}];
-          var pageItem = page.allPageItems[${objectIndex}];
-          var swatch = doc.swatches.itemByName("${swatchName}");
+          var page = doc.pages[${index(pageIndex, { name: 'pageIndex' })}];
+          var pageItem = page.allPageItems[${index(objectIndex, { name: 'objectIndex' })}];
+          var swatch = doc.swatches.itemByName(${str(swatchName)});
           
           if (!swatch.isValid) {
-            "Color swatch '${swatchName}' not found";
+            "Color swatch '" + ${str(swatchName)} + "' not found";
           } else {
-            if ("${property}" === "fill") {
+            if (${str(property)} === "fill") {
               pageItem.fillColor = swatch;
-            } else if ("${property}" === "stroke") {
+            } else if (${str(property)} === "stroke") {
               pageItem.strokeColor = swatch;
             }
             
-            "Color '${swatchName}' applied to ${property} of object ${objectIndex}";
+            "Color '" + ${str(swatchName)} + "' applied to " + ${str(property)} + " of object " + ${index(objectIndex, { name: 'objectIndex' })} + "";
           }
         } catch (e) {
           "Error applying color: " + e.message;
@@ -3576,43 +3626,43 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
       } else {
         var doc = app.activeDocument;
         try {
-          var pdfFile = File("${validatedPath.replace(/\\/g, '\\\\')}");
+          var pdfFile = File(${jsxPath(validatedPath)});
           var pdfPreset;
           
           // Try to get the specified preset
           try {
-            pdfPreset = app.pdfExportPresets.itemByName("[${preset}]");
+            pdfPreset = app.pdfExportPresets.itemByName("[" + ${str(preset)} + "]");
           } catch (e) {
             pdfPreset = app.pdfExportPresets[0]; // Use first available preset
           }
           
           // Customize export preferences
           ${pageRange !== 'all' ? `
-            app.pdfExportPreferences.pageRange = "${pageRange}";
+            app.pdfExportPreferences.pageRange = ${str(pageRange)};
           ` : `
             app.pdfExportPreferences.pageRange = PageRange.ALL_PAGES;
           `}
           
-          app.pdfExportPreferences.includeBleedMarks = ${includeBleed};
-          app.pdfExportPreferences.includeSlugArea = ${includeSlug};
+          app.pdfExportPreferences.includeBleedMarks = ${bool(includeBleed)};
+          app.pdfExportPreferences.includeSlugArea = ${bool(includeSlug)};
           
           ${colorProfile ? `
             app.pdfExportPreferences.outputIntention = OutputIntention.REPURPOSE;
           ` : ''}
           
           // Set JPEG quality
-          if ("${jpegQuality}" === "Low") {
+          if (${str(jpegQuality)} === "Low") {
             app.pdfExportPreferences.jpegQuality = JPEGOptionsQuality.LOW;
-          } else if ("${jpegQuality}" === "Medium") {
+          } else if (${str(jpegQuality)} === "Medium") {
             app.pdfExportPreferences.jpegQuality = JPEGOptionsQuality.MEDIUM;
-          } else if ("${jpegQuality}" === "High") {
+          } else if (${str(jpegQuality)} === "High") {
             app.pdfExportPreferences.jpegQuality = JPEGOptionsQuality.HIGH;
-          } else if ("${jpegQuality}" === "Maximum") {
+          } else if (${str(jpegQuality)} === "Maximum") {
             app.pdfExportPreferences.jpegQuality = JPEGOptionsQuality.MAXIMUM;
           }
           
           doc.exportFile(ExportFormat.PDF_TYPE, pdfFile, false, pdfPreset);
-          "PDF exported successfully to: ${filePath}";
+          "PDF exported successfully to: " + ${str(filePath)} + "";
         } catch (e) {
           "Error exporting PDF: " + e.message;
         }
@@ -3638,7 +3688,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
       } else {
         var doc = app.activeDocument;
         try {
-          var exportFolder = Folder("${validatedPath.replace(/\\/g, '\\\\')}");
+          var exportFolder = Folder(${jsxPath(validatedPath)});
           if (!exportFolder.exists) {
             exportFolder.create();
           }
@@ -3646,18 +3696,18 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           var exportFormat;
           var fileExtension;
           
-          switch ("${format}") {
+          switch (${str(format)}) {
             case "PNG":
               exportFormat = ExportFormat.PNG_FORMAT;
               fileExtension = ".png";
-              app.pngExportPreferences.resolution = ${resolution};
-              app.pngExportPreferences.useDocumentBleedWithPDF = ${includeBleed};
+              app.pngExportPreferences.resolution = ${num(resolution, { name: 'resolution' })};
+              app.pngExportPreferences.useDocumentBleedWithPDF = ${bool(includeBleed)};
               break;
             case "JPEG":
               exportFormat = ExportFormat.JPG;
               fileExtension = ".jpg";
-              app.jpegExportPreferences.resolution = ${resolution};
-              app.jpegExportPreferences.useDocumentBleedWithPDF = ${includeBleed};
+              app.jpegExportPreferences.resolution = ${num(resolution, { name: 'resolution' })};
+              app.jpegExportPreferences.useDocumentBleedWithPDF = ${bool(includeBleed)};
               break;
             default:
               exportFormat = ExportFormat.PNG_FORMAT;
@@ -3671,7 +3721,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
             }
           ` : `
             // Parse page range (simplified)
-            var pageNumbers = "${pageRange}".split("-");
+            var pageNumbers = ${str(pageRange)}.split("-");
             var startPage = parseInt(pageNumbers[0]) - 1;
             var endPage = pageNumbers.length > 1 ? parseInt(pageNumbers[1]) - 1 : startPage;
             
@@ -3688,7 +3738,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
             page.exportFile(exportFormat, exportFile);
           }
           
-          "Exported " + pages.length + " pages as ${format} files to: ${folderPath}";
+          "Exported " + pages.length + " pages as " + ${str(format)} + " files to: " + ${str(folderPath)} + "";
         } catch (e) {
           "Error exporting images: " + e.message;
         }
@@ -3714,7 +3764,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
       } else {
         var doc = app.activeDocument;
         try {
-          var epubFile = File("${validatedPath.replace(/\\/g, '\\\\')}");
+          var epubFile = File(${jsxPath(validatedPath)});
           
           // Set EPUB export preferences
           var epubExportPrefs = app.epubExportPreferences;
@@ -3723,9 +3773,9 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           
           ${includeImages ? `
             epubExportPrefs.imageConversion = ImageConversion.AUTOMATIC;
-            if ("${imageFormat}" === "PNG") {
+            if (${str(imageFormat)} === "PNG") {
               epubExportPrefs.pngQualityLevel = PNGQualityLevel.HIGH;
-            } else if ("${imageFormat}" === "JPEG") {
+            } else if (${str(imageFormat)} === "JPEG") {
               epubExportPrefs.jpegOptionsQuality = JPEGOptionsQuality.HIGH;
             }
           ` : `
@@ -3733,7 +3783,7 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
           `}
           
           doc.exportFile(ExportFormat.EPUB, epubFile);
-          "EPUB exported successfully to: ${validatedPath}";
+          "EPUB exported successfully to: " + ${jsxPath(validatedPath)} + "";
         } catch (e) {
           "Error exporting EPUB: " + e.message;
         }
@@ -3759,11 +3809,11 @@ CAUTION: Only do this if you understand the risks and have verified the operatio
       } else {
         var doc = app.activeDocument;
         try {
-          var packageFolder = Folder("${validatedPath.replace(/\\/g, '\\\\')}");
+          var packageFolder = Folder(${jsxPath(validatedPath)});
           
-          doc.packageForPrint(packageFolder, ${includeLinkedFiles}, ${includeFonts}, true, ${createReport}, "Package created by InDesign MCP Server");
+          doc.packageForPrint(packageFolder, ${bool(includeLinkedFiles)}, ${bool(includeFonts)}, true, ${bool(createReport)}, "Package created by InDesign MCP Server");
           
-          "Document packaged successfully to: ${folderPath}";
+          "Document packaged successfully to: " + ${str(folderPath)} + "";
         } catch (e) {
           "Error packaging document: " + e.message;
         }
@@ -3847,18 +3897,18 @@ Usage: INDESIGN_ALLOW_ARBITRARY_CODE=1 node index.js`
       } else {
         var doc = app.activeDocument;
         try {
-          var page = doc.pages[${pageIndex}];
+          var page = doc.pages[${index(pageIndex, { name: 'pageIndex' })}];
           var textFrame = page.textFrames.add();
-          textFrame.geometricBounds = ["${y}mm", "${x}mm", "${y + height}mm", "${x + width}mm"];
+          textFrame.geometricBounds = [${measure(y, { unit: 'mm', name: 'y' })}, ${measure(x, { unit: 'mm', name: 'x' })}, ${measure(y + height, { unit: 'mm', name: 'y' })}, ${measure(x + width, { unit: 'mm', name: 'x' })}];
           
           var table = textFrame.tables.add();
-          table.rowCount = ${rows};
-          table.columnCount = ${columns};
+          table.rowCount = ${num(rows, { name: 'rows' })};
+          table.columnCount = ${num(columns, { name: 'columns' })};
           
-          ${headerRows > 0 ? `table.headerRowCount = ${headerRows};` : ''}
-          ${footerRows > 0 ? `table.footerRowCount = ${footerRows};` : ''}
+          ${headerRows > 0 ? `table.headerRowCount = ${num(headerRows, { name: 'headerRows' })};` : ''}
+          ${footerRows > 0 ? `table.footerRowCount = ${num(footerRows, { name: 'footerRows' })};` : ''}
           
-          "Table created with " + ${rows} + " rows and " + ${columns} + " columns on page " + (${pageIndex} + 1);
+          "Table created with " + ${num(rows, { name: 'rows' })} + " rows and " + ${num(columns, { name: 'columns' })} + " columns on page " + (${index(pageIndex, { name: 'pageIndex' })} + 1);
         } catch (e) {
           "Error creating table: " + e.message;
         }
@@ -3878,7 +3928,7 @@ Usage: INDESIGN_ALLOW_ARBITRARY_CODE=1 node index.js`
       } else {
         var doc = app.activeDocument;
         try {
-          var page = doc.pages[${pageIndex}];
+          var page = doc.pages[${index(pageIndex, { name: 'pageIndex' })}];
           var tables = [];
           
           // Collect all tables from text frames
@@ -3888,11 +3938,11 @@ Usage: INDESIGN_ALLOW_ARBITRARY_CODE=1 node index.js`
             }
           }
           
-          if (${tableIndex} >= tables.length) {
-            "Table index ${tableIndex} not found. Page has " + tables.length + " tables.";
+          if (${index(tableIndex, { name: 'tableIndex' })} >= tables.length) {
+            "Table index " + ${index(tableIndex, { name: 'tableIndex' })} + " not found. Page has " + tables.length + " tables.";
           } else {
-            var table = tables[${tableIndex}];
-            var tableData = ${JSON.stringify(data)};
+            var table = tables[${index(tableIndex, { name: 'tableIndex' })}];
+            var tableData = ${json(data)};
             
             for (var row = 0; row < tableData.length && row < table.rowCount; row++) {
               for (var col = 0; col < tableData[row].length && col < table.columnCount; col++) {
@@ -3923,17 +3973,17 @@ Usage: INDESIGN_ALLOW_ARBITRARY_CODE=1 node index.js`
         var doc = app.activeDocument;
         try {
           var layer = doc.layers.add();
-          layer.name = "${name}";
-          layer.visible = ${visible};
-          layer.locked = ${locked};
+          layer.name = ${str(name)};
+          layer.visible = ${bool(visible)};
+          layer.locked = ${bool(locked)};
           
           ${color ? `
             try {
-              layer.layerColor = UIColors.${color.toUpperCase()};
+              layer.layerColor = UIColors.${enumOf(color.toUpperCase(), ALLOWED.uiColor, { name: 'color' })};
             } catch (e) {}
           ` : ''}
           
-          "Layer '${name}' created successfully";
+          "Layer '" + ${str(name)} + "' created successfully";
         } catch (e) {
           "Error creating layer: " + e.message;
         }
@@ -3953,12 +4003,12 @@ Usage: INDESIGN_ALLOW_ARBITRARY_CODE=1 node index.js`
       } else {
         var doc = app.activeDocument;
         try {
-          var layer = doc.layers.itemByName("${layerName}");
+          var layer = doc.layers.itemByName(${str(layerName)});
           if (layer.isValid) {
             doc.activeLayer = layer;
-            "Active layer set to: ${layerName}";
+            "Active layer set to: " + ${str(layerName)} + "";
           } else {
-            "Layer '${layerName}' not found";
+            "Layer '" + ${str(layerName)} + "' not found";
           }
         } catch (e) {
           "Error setting active layer: " + e.message;
@@ -4009,7 +4059,7 @@ Usage: INDESIGN_ALLOW_ARBITRARY_CODE=1 node index.js`
           var preflightProfile;
           
           ${profile ? `
-            preflightProfile = app.preflightProfiles.itemByName("${profile}");
+            preflightProfile = app.preflightProfiles.itemByName(${str(profile)});
             if (!preflightProfile.isValid) {
               preflightProfile = app.preflightProfiles[0];
             }
@@ -4041,12 +4091,12 @@ Usage: INDESIGN_ALLOW_ARBITRARY_CODE=1 node index.js`
         var doc = app.activeDocument;
         try {
           ${pageIndex !== undefined ? `
-            if (${pageIndex} >= 0 && ${pageIndex} < doc.pages.length) {
-              app.activeWindow.activePage = doc.pages[${pageIndex}];
+            if (${index(pageIndex, { name: 'pageIndex' })} >= 0 && ${index(pageIndex, { name: 'pageIndex' })} < doc.pages.length) {
+              app.activeWindow.activePage = doc.pages[${index(pageIndex, { name: 'pageIndex' })}];
             }
           ` : ''}
           
-          switch ("${fitOption}") {
+          switch (${str(fitOption)}) {
             case "FIT_PAGE":
               app.activeWindow.zoom(ZoomOptions.FIT_PAGE);
               break;
@@ -4060,7 +4110,7 @@ Usage: INDESIGN_ALLOW_ARBITRARY_CODE=1 node index.js`
               app.activeWindow.zoom(ZoomOptions.FIT_PAGE);
           }
           
-          "Zoom applied: ${fitOption}${pageIndex !== undefined ? ` on page ${pageIndex + 1}` : ''}";
+          "Zoom applied: " + ${str(fitOption)} + "${pageIndex !== undefined ? ` on page ${num(pageIndex + 1, { name: 'pageIndex' })}` : ''}";
         } catch (e) {
           "Error zooming: " + e.message;
         }
@@ -4087,14 +4137,14 @@ Usage: INDESIGN_ALLOW_ARBITRARY_CODE=1 node index.js`
       } else {
         var doc = app.activeDocument;
         try {
-          var dataSource = File("${validatedDataSource.replace(/\\/g, '\\\\')}");
+          var dataSource = File(${jsxPath(validatedDataSource)});
           if (!dataSource.exists) {
-            "Data source file not found: ${validatedDataSource}";
+            "Data source file not found: " + ${jsxPath(validatedDataSource)} + "";
           } else {
             // Set up data merge
             doc.dataMergeProperties.dataMergeSource = dataSource;
             
-            var outputDir = Folder("${validatedOutputFolder.replace(/\\/g, '\\\\')}");
+            var outputDir = Folder(${jsxPath(validatedOutputFolder)});
             if (!outputDir.exists) {
               outputDir.create();
             }
@@ -4104,13 +4154,13 @@ Usage: INDESIGN_ALLOW_ARBITRARY_CODE=1 node index.js`
               doc.dataMergeProperties.exportRecords(RecordsToMerge.ALL_RECORDS, outputDir, true);
             ` : `
               // Parse record range
-              var ranges = "${recordRange}".split("-");
+              var ranges = ${str(recordRange)}.split("-");
               var startRecord = parseInt(ranges[0]);
               var endRecord = ranges.length > 1 ? parseInt(ranges[1]) : startRecord;
               doc.dataMergeProperties.exportRecords(RecordsToMerge.RANGE, outputDir, true, startRecord, endRecord);
             `}
             
-            "Data merge completed. Files saved to: ${validatedOutputFolder}";
+            "Data merge completed. Files saved to: " + ${jsxPath(validatedOutputFolder)} + "";
           }
         } catch (e) {
           "Error in data merge: " + e.message;

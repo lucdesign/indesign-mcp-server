@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "dev": "node --inspect index.js"
+    "dev": "node --inspect index.js",
+    "test": "node --test test/scripts.test.mjs test/injection.test.mjs"
   },
   "keywords": [
     "mcp",
