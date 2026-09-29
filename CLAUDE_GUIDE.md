@@ -1,160 +1,62 @@
-# InDesign MCP Server - Claude Usage Guide
+# InDesign MCP Server - Usage Guide for AI Assistants
 
-## Enhanced Features for Better Claude Integration
+How to work with this server reliably. The complete tool and parameter reference is in `README.md`.
 
-### 🎯 Problem Solved: Selected Text Frames & Markdown Formatting
+## Rules of thumb
 
-This enhanced MCP server now provides tools that Claude needs to work efficiently with InDesign:
+1. **Use ids, not indices.** Every `create_*` tool and `place_image` returns `id=<number>`. Pass it as `frameId` (text tools) or `id` (object tools). Indices (`frameIndex`, `index`) count from the *frontmost* object and shift whenever objects are added, deleted or reordered.
+2. **Discover before you act.** `list_open_documents`, `get_document_info`, `list_page_items`, `list_text_frames`, `list_styles`, `list_color_swatches`, `get_selected_objects`.
+3. **Create styles first, then use them.** Formatting belongs in paragraph/character styles. Pass `paragraphStyle` to `create_text_frame`; pass only the formatting parameters you really want as local overrides.
+4. **Read the result.** Text tools report `overflows=true` when the text does not fit; fix it by resizing (`set_object_geometry`) or shortening the text.
+5. **Everything is millimetres**, origin at the top-left of each page's trim area, negative values reach into the bleed. Angles are degrees, counter-clockwise positive.
 
-## Essential Workflow for Claude
-
-### 1. Finding Text Frames
-**ALWAYS start with discovery tools:**
-
-```javascript
-// Option A: List all text frames on a page
-await list_text_frames({ pageIndex: 0 })
-
-// Option B: Get info about selected objects
-await get_selected_objects()
-```
-
-### 2. Working with Selected Frames
-When user manually selects a text frame in InDesign:
+## Typical workflow
 
 ```javascript
-// Check what's selected
-await get_selected_objects()
-// This will show: "Text Frame - Content: Hello World (Frame Index: 2)"
+create_document({ preset: "A5", orientation: "Landscape", pages: 2, bleed: 3 })
+create_paragraph_style({ name: "Title", fontFamily: "Helvetica Neue", fontStyle: "Bold", fontSize: 24, leading: 28 })
+create_paragraph_style({ name: "Body", fontFamily: "Helvetica Neue", fontStyle: "Regular", fontSize: 10, leading: 13 })
+create_character_style({ name: "Bold", fontFamily: "Helvetica Neue", fontStyle: "Bold" })
 
-// Then use the Frame Index with other functions
-await edit_text_frame({ frameIndex: 2, content: "New content" })
+create_text_frame({ content: "Headline", paragraphStyle: "Title", x: 10, y: 10, width: 120, height: 20 })
+// -> "Text frame created: id=250 ... overflows=false"
+create_text_frame({ content: "Um 7.30 Uhr beginnt es", paragraphStyle: "Body", x: 10, y: 40, width: 120, height: 30 })
+apply_character_style_to_range({ frameId: 251, styleName: "Bold", matchText: "7.30 Uhr" })
+
+place_image({ imagePath: "/Users/me/photo.jpg", x: 140, y: 10, width: 60, height: 60, fitOption: "FILL_PROPORTIONALLY" })
+rotate_object({ id: 252, angle: 5 })
+
+export_pdf({ filePath: "/Users/me/flyer.pdf", preset: "HighQualityPrint", includeBleed: true, confirmDestructive: true })
 ```
 
-### 3. Markdown Text Insertion
-**NEW FEATURE:** Insert markdown text with automatic formatting:
+## Vector shapes and previews
 
-```javascript
-// Insert markdown into selected frame
-await insert_markdown_text({
-  markdownText: `# Header\n**Bold text** and *italic text*\nRegular paragraph`,
-  useSelectedFrame: true
-})
+- Draw curves with `create_path_from_svg` (SVG path data + viewBox scaled into an x/y/width/height rectangle in mm) or `create_path` (anchor points with handles). Both return an id; `edit_path_points` reads and changes the points, `get_object_info` shows everything about an object.
+- Change colours in place with `set_object_fill` / `set_object_stroke` (keeps the stacking order); use swatches, so CMYK is exact.
+- Check your work: `render_preview` returns the page (or one object) as an image, `measure_text` reports line count/widths/overflow. Do this after layout changes instead of exporting files.
+- Logos: try native paths first; `place_graphic` for .svg/.pdf/.ai/.eps files; `create_graphic_from_svg` only as a fallback (RGB converted, not editable).
+- Do not open or switch documents in InDesign while tools run.
 
-// Or insert into specific frame
-await insert_markdown_text({
-  markdownText: "# My Header\n\nSome content",
-  frameIndex: 0,
-  pageIndex: 0
-})
-```
+## Text
 
-## Markdown Features Supported
+- `\n` in `content` is a **paragraph break**; `lineBreak: "forced"` or `<br>` gives a forced line break.
+- `edit_text_frame` with `content` replaces the whole story.
+- `insert_markdown_text` maps Markdown to existing styles (`Heading 1`-`6`, `Bold`, `Italic`, `Bold Italic`; override with `styleMap`). It fails, changing nothing, if a style is missing - create the styles first.
+- `fix_typography_in_selection` and `clean_imported_text` use GREP find/change, so character styles and formatting survive.
+- With the user's selection: `get_selected_objects` shows what is selected; `useSelectedFrame: true` works with the typography and Markdown tools.
 
-- **Headers:** `# Header 1`, `## Header 2`, etc.
-- **Bold:** `**bold text**`
-- **Italic:** `*italic text*`
-- **Automatic style application** using existing InDesign styles
+## Errors and what to do
 
-### Style Mapping
-The system looks for these InDesign styles:
-- **Headers:** "Header 1", "Heading 1", "H1", "Header1"
-- **Bold:** "Bold", "Strong"
-- **Italic:** "Italic", "Emphasis"
+| Message | Meaning / next step |
+|---|---|
+| `No document open` | Open or create a document first. |
+| `No object with id N` | The object was deleted; call `list_page_items`. |
+| `Invalid index: N` | Index out of range; prefer ids. |
+| `Paragraph style not found: X` / `Character style ...` / `Object style ...` / `Swatch not found: X` | Create it first (`create_paragraph_style`, `create_color_swatch`, ...) or use `list_styles` / `list_color_swatches`. |
+| `Font not installed: F (S)` | Check the exact family and style names. |
+| `Missing styles - ...` | `insert_markdown_text`: create the listed styles or pass `styleMap`. |
+| `save_document`: `has never been saved: pass filePath` / `already exists ... confirmDestructive` / `already open in the document` | A new document needs a `filePath`; overwriting a different existing file needs `confirmDestructive: true`; a file that is open in another document cannot be a Save As target. |
+| `Security confirmation required` | Destructive tools (export, save-as, delete page, close with changes, data merge, package) need `confirmDestructive: true`; only add it when the user asked for that action. |
+| `... [debug script: path]` | Unexpected InDesign failure; the generated script was kept at that path. |
 
-## Error Messages Guide for Claude
-
-### Common Errors and Solutions:
-
-**"Invalid text frame index: 5"**
-→ Use `list_text_frames()` first to see available frames
-
-**"No text frame selected"**
-→ User needs to select a frame in InDesign, then use `get_selected_objects()`
-
-**"No objects selected"**
-→ Tell user to select a text frame in InDesign first
-
-## Best Practices for Claude
-
-### 1. Always Check Before Acting
-```javascript
-// Don't assume - always check first
-const frames = await list_text_frames({ pageIndex: 0 });
-// Then use the correct frameIndex
-```
-
-### 2. Use Selected Objects When Available
-```javascript
-// When user says "put text in this frame"
-const selected = await get_selected_objects();
-// Check if it shows a text frame with Frame Index
-```
-
-### 3. Provide Clear Instructions
-When errors occur, tell user:
-- "Please select the text frame in InDesign first"
-- "I found 3 text frames on this page - which one do you want?"
-
-## Function Reference
-
-### Discovery Functions
-- `get_selected_objects()` - See what user has selected
-- `list_text_frames(pageIndex)` - List all text frames on page
-- `list_styles()` - See available paragraph/character styles
-
-### Text Functions
-- `insert_markdown_text()` - **NEW:** Insert formatted markdown
-- `create_text_frame()` - Create new text frame
-- `edit_text_frame()` - Edit existing frame (requires frameIndex)
-
-### Style Functions
-- `apply_paragraph_style()` - Apply existing paragraph style
-- `create_paragraph_style()` - Create new paragraph style
-
-## Example Claude Workflows
-
-### Workflow 1: User Selected Frame
-```
-User: "Put this markdown text in the selected frame"
-Claude: 
-1. get_selected_objects()
-2. If text frame found → insert_markdown_text({ useSelectedFrame: true })
-3. If no frame selected → Ask user to select frame first
-```
-
-### Workflow 2: Specific Frame
-```
-User: "Put text in the first frame on page 2"
-Claude:
-1. list_text_frames({ pageIndex: 1 })
-2. insert_markdown_text({ frameIndex: 0, pageIndex: 1 })
-```
-
-### Workflow 3: No Frames Exist
-```
-User: "Add this text to the page"
-Claude:
-1. list_text_frames({ pageIndex: 0 })
-2. If no frames → create_text_frame() first
-3. Then insert_markdown_text()
-```
-
-## Pro Tips for Claude
-
-1. **Frame Index is Zero-Based:** First frame = 0, second = 1, etc.
-2. **Page Index is Zero-Based:** First page = 0, second = 1, etc.
-3. **Always Use Discovery First:** Don't guess frame indices
-4. **Selected Objects Have Priority:** If user selected something, use it
-5. **Error Messages Are Helpful:** They tell you exactly what to do next
-
-## Troubleshooting
-
-**Claude keeps using wrong frameIndex:**
-→ Make sure to call `list_text_frames()` or `get_selected_objects()` first
-
-**Markdown formatting not working:**
-→ Check if document has appropriate paragraph/character styles
-
-**"No document open" errors:**
-→ User needs to have InDesign document open first
+`execute_indesign_code` is disabled unless the server runs with `INDESIGN_ALLOW_ARBITRARY_CODE=1`. Do not ask users to enable it; the dedicated tools cover normal work.
